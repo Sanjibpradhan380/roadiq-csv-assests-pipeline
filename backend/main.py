@@ -1,11 +1,12 @@
 import os
 import uuid
 import zipfile
+import shutil
 import cv2
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -25,6 +26,12 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 CSV_UPLOAD_DIR = os.path.join("uploaded_csvs")
 os.makedirs(CSV_UPLOAD_DIR, exist_ok=True)
+
+ZIP_UPLOAD_DIR = os.path.join("uploaded_zips")
+os.makedirs(ZIP_UPLOAD_DIR, exist_ok=True)
+
+ZIP_PROCESS_DIR = os.path.join("zip_processing")
+os.makedirs(ZIP_PROCESS_DIR, exist_ok=True)
 
 # Global counter for screenshot folders
 screenshot_counter = 1
@@ -303,6 +310,236 @@ def build_final_csv_path(video_filename: str) -> str:
         df.to_csv(final_csv_path, index=False)
 
     return final_csv_path
+
+
+@app.post("/upload-zip")
+async def upload_zip(zip_file: UploadFile = File(...)):
+    """
+    Handle ZIP file upload containing .webp images and _filter.csv
+    Returns a session ID for tracking the uploaded file
+    """
+    try:
+        if not zip_file.filename.endswith(".zip"):
+            raise HTTPException(status_code=400, detail="File must be a ZIP file")
+        
+        # Generate unique session ID
+        session_id = str(uuid.uuid4())
+        session_dir = os.path.join(ZIP_PROCESS_DIR, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        
+        # Save ZIP file
+        zip_path = os.path.join(session_dir, zip_file.filename)
+        with open(zip_path, "wb") as buffer:
+            content = await zip_file.read()
+            buffer.write(content)
+        
+        # Extract ZIP file
+        extract_dir = os.path.join(session_dir, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+        
+        # Check for _filter.csv
+        filter_csv_path = None
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith("_filter.csv"):
+                    filter_csv_path = os.path.join(root, file)
+                    break
+            if filter_csv_path:
+                break
+        
+        if not filter_csv_path:
+            shutil.rmtree(session_dir)
+            raise HTTPException(status_code=400, detail="_filter.csv not found in ZIP file")
+        
+        # Check for .webp images
+        webp_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith(".webp"):
+                    webp_files.append(os.path.join(root, file))
+
+        if not webp_files:
+            shutil.rmtree(session_dir)
+            raise HTTPException(status_code=400, detail="No .webp images found in ZIP file")
+
+        # Create _final.csv from extracted images and _filter.csv
+        try:
+            df = pd.read_csv(filter_csv_path)
+            webp_images = {os.path.splitext(os.path.basename(path))[0]: path for path in webp_files}
+
+            if "uuid" in df.columns:
+                df["uuid_str"] = df["uuid"].astype(str)
+                df = df[df["uuid_str"].isin(webp_images.keys())].copy()
+                df = df.drop(columns=["uuid_str"])
+                df = df.sort_values("uuid").reset_index(drop=True)
+            else:
+                df = df.reset_index(drop=True)
+
+            # Create filename based on ZIP filename
+            zip_base_name = os.path.splitext(zip_file.filename)[0]
+            final_csv_filename = f"{zip_base_name}_final.csv"
+            final_csv_path = os.path.join(session_dir, final_csv_filename)
+            df.to_csv(final_csv_path, index=False)
+        except Exception as e:
+            shutil.rmtree(session_dir)
+            raise HTTPException(status_code=500, detail=f"Failed to create _final.csv: {str(e)}")
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "message": f"ZIP file extracted and _final.csv created successfully. Found {len(webp_files)} images and _filter.csv",
+            "image_count": len(webp_files)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing ZIP file: {str(e)}")
+
+
+@app.get("/download-final-csv")
+async def download_final_csv(session_id: str):
+    """
+    Generate and download _final.csv based on uploaded ZIP contents
+    """
+    try:
+        session_dir = os.path.join(ZIP_PROCESS_DIR, session_id)
+        
+        if not os.path.exists(session_dir):
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        extract_dir = os.path.join(session_dir, "extracted")
+        
+        # Find _filter.csv
+        filter_csv_path = None
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith("_filter.csv"):
+                    filter_csv_path = os.path.join(root, file)
+                    break
+            if filter_csv_path:
+                break
+        
+        if not filter_csv_path:
+            raise HTTPException(status_code=404, detail="_filter.csv not found")
+        
+        # Read _filter.csv
+        df = pd.read_csv(filter_csv_path)
+        
+        # Find all .webp images and create mapping
+        webp_images = {}
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                if file.endswith(".webp"):
+                    # Extract filename without extension
+                    base_name = os.path.splitext(file)[0]
+                    file_path = os.path.join(root, file)
+                    webp_images[base_name] = file_path
+        
+        # Filter CSV to include only rows that have corresponding images
+        if "uuid" in df.columns:
+            # Convert uuid to string for matching
+            df['uuid_str'] = df['uuid'].astype(str)
+            df = df[df['uuid_str'].isin(webp_images.keys())].copy()
+            df = df.drop('uuid_str', axis=1)
+        
+        # Sort by uuid if present
+        if "uuid" in df.columns:
+            df = df.sort_values("uuid").reset_index(drop=True)
+        
+        # Find the ZIP filename to create the final CSV filename
+        zip_files = [f for f in os.listdir(session_dir) if f.lower().endswith('.zip')]
+        if zip_files:
+            zip_base_name = os.path.splitext(zip_files[0])[0]
+            final_csv_filename = f"{zip_base_name}_final.csv"
+        else:
+            final_csv_filename = "_final.csv"
+        
+        # Save _final.csv
+        final_csv_path = os.path.join(session_dir, final_csv_filename)
+        df.to_csv(final_csv_path, index=False)
+        
+        # Return file
+        return FileResponse(
+            final_csv_path,
+            filename=final_csv_filename,
+            media_type="text/csv"
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating final CSV: {str(e)}")
+
+
+@app.get("/get-final-csv-filename")
+async def get_final_csv_filename(session_id: str):
+    """
+    Get the filename of the final CSV file for this session
+    """
+    try:
+        session_dir = os.path.join(ZIP_PROCESS_DIR, session_id)
+        
+        if not os.path.exists(session_dir):
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Find the ZIP file to determine the filename
+        zip_files = [f for f in os.listdir(session_dir) if f.lower().endswith('.zip')]
+        if zip_files:
+            zip_base_name = os.path.splitext(zip_files[0])[0]
+            final_csv_filename = f"{zip_base_name}_final.csv"
+        else:
+            final_csv_filename = "_final.csv"
+        
+        return {
+            "filename": final_csv_filename
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting filename: {str(e)}")
+
+
+@app.get("/download-uploaded-zip")
+async def download_uploaded_zip(session_id: str):
+    session_dir = os.path.join(ZIP_PROCESS_DIR, session_id)
+    if not os.path.exists(session_dir):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    zip_files = [f for f in os.listdir(session_dir) if f.lower().endswith('.zip')]
+    if not zip_files:
+        raise HTTPException(status_code=404, detail="Uploaded ZIP file not found")
+
+    zip_path = os.path.join(session_dir, zip_files[0])
+    return FileResponse(
+        zip_path,
+        filename=os.path.basename(zip_path),
+        media_type="application/zip",
+    )
+
+
+@app.post("/cleanup-session")
+async def cleanup_session(session_id: str):
+    """
+    Clean up uploaded files after download
+    """
+    try:
+        session_dir = os.path.join(ZIP_PROCESS_DIR, session_id)
+        
+        if os.path.exists(session_dir):
+            shutil.rmtree(session_dir)
+        
+        return {
+            "success": True,
+            "message": "Session cleaned up successfully"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cleaning up session: {str(e)}")
 
 @app.get("/download_filtered_csv")
 async def download_filtered_csv(video_filename: str):
